@@ -33,7 +33,9 @@ export class KoraRail implements PayoutRail {
       rail: "kora",
     };
 
-    const payload = {
+    const isPublicHttps = notificationUrl.startsWith("https://");
+
+    const payload: Record<string, any> = {
       reference: params.reference,
       destination: {
         type: "bank_account",
@@ -41,17 +43,20 @@ export class KoraRail implements PayoutRail {
         currency: "NGN",
         narration: params.narration ?? `Ailo: ${params.payment_id}`,
         bank_account: {
-          bank: params.destination_bank_code ?? "044",
-          account: params.destination_account_number ?? "0690000031",
+          bank: params.destination_bank_code ?? "033",
+          account: params.destination_account_number ?? "0000000000",
         },
         customer: {
           name: params.payee_name,
-          email: params.payee_email ?? `${params.payee_id.replace(/[^a-zA-Z0-9]/g, "") || "payee"}@ailo.internal`,
+          email: params.payee_email ?? `${params.payee_id.replace(/[^a-zA-Z0-9]/g, "") || "payee"}@example.com`,
         },
       },
       metadata,
-      notification_url: notificationUrl,
     };
+
+    if (isPublicHttps) {
+      payload.notification_url = notificationUrl;
+    }
 
     try {
       const res = await fetch(`${this.baseUrl}/transactions/disburse`, {
@@ -78,10 +83,18 @@ export class KoraRail implements PayoutRail {
           };
         }
 
+        let errorMsg = data?.message ?? `Kora error HTTP ${res.status}`;
+        if (data?.data && typeof data.data === "object") {
+          const fieldMsgs = Object.values(data.data)
+            .map((v: any) => v?.message || String(v))
+            .filter(Boolean);
+          if (fieldMsgs.length > 0) errorMsg = fieldMsgs.join(", ");
+        }
+
         return {
           reference: params.reference,
           status: "failed",
-          error: data?.message ?? `Kora error HTTP ${res.status}`,
+          error: errorMsg,
           raw_response: data,
         };
       }
