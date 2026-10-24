@@ -315,7 +315,7 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"amount_kobo\": 250000,\n  \"currency\": \"NGN\",\n  \"payee_id\": \"payee_supplier_98\",\n  \"payee_name\": \"Lagos Logistics Ltd\",\n  \"destination_bank_code\": \"044\",\n  \"destination_account_number\": \"0690000031\",\n  \"narration\": \"Dispatch fee payment\",\n  \"rules_context\": {\n    \"category\": \"logistics\",\n    \"department\": \"ops\"\n  }\n}"
+              "raw": "{\n  \"payee_id\": \"payee_mama_ngozi\",\n  \"amount_kobo\": 250000,\n  \"category\": \"groceries\",\n  \"reason\": \"Restocking rice from Mama Ngozi\"\n}"
             },
             "url": {
               "raw": "{{baseUrl}}/v1/payments",
