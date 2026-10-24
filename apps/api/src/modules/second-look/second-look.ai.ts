@@ -7,7 +7,7 @@ import type { SecondLookDeps } from "./second-look.service";
 
 const PROVIDERS = { google, openai, anthropic };
 
-// Real model adapter for secondLook. Not wired in yet.
+// Real model adapter for secondLook, wired in server.ts.
 export function createDecider(env: { LLM_PROVIDER: keyof typeof PROVIDERS; LLM_MODEL_FAST: string }): SecondLookDeps["decide"] {
   const model = PROVIDERS[env.LLM_PROVIDER](env.LLM_MODEL_FAST);
   return async (prompt, signal) => {

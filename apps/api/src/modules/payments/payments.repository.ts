@@ -80,6 +80,22 @@ export class PaymentsRepository {
       .reduce((sum, r) => sum + r.amount_kobo, 0);
   }
 
+  async countPayeePayments24h(payeeId: string): Promise<number> {
+    const coll = await this.getPaymentsCollection();
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const records = await coll.find({ payee_id: payeeId }).toArray();
+    return records.filter((r) => r.created_at >= since && !["blocked", "failed", "cancelled"].includes(r.status)).length;
+  }
+
+  async getDailySpend(agentId: string): Promise<number> {
+    const coll = await this.getPaymentsCollection();
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+    const records = await coll.find({ agent_id: agentId }).toArray();
+    return records
+      .filter((r) => r.created_at >= since && !["blocked", "failed", "cancelled"].includes(r.status))
+      .reduce((sum, r) => sum + r.amount_kobo, 0);
+  }
+
   async getWeeklySpend(agentId: string): Promise<number> {
     const coll = await this.getPaymentsCollection();
     const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();

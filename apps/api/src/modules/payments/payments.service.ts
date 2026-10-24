@@ -1,10 +1,13 @@
-import { formatNaira, type Check, type Payment, type PaymentRequest, type Receipt, type SpendPolicy } from "@ailo/core";
+import { evaluatePolicy, formatNaira, type Check, type Payment, type PaymentRequest, type Receipt } from "@ailo/core";
 import { AppError } from "../../shared/AppError";
 import { eventsService } from "../events/events.service";
 import { ledgerService } from "../ledger/ledger.service";
 import { approvalsService } from "../approvals/approvals.service";
+import * as mandates from "../mandates/mandates.service";
 import { getPayee } from "../payees/payees";
 import { getPayoutRail } from "../rails";
+import { shouldSecondLook } from "../second-look/second-look.flags";
+import { secondLook, type SecondLookDeps, type SecondLookOutcome } from "../second-look/second-look.service";
 
 // Bank details come only from the server-side payee directory, never from the agent's request (PRD 5.9).
 function payoutAccount(payeeId: string) {
@@ -14,12 +17,15 @@ function payoutAccount(payeeId: string) {
     : {};
 }
 import { paymentsRepository, PaymentsRepository } from "./payments.repository";
-import { DEFAULT_DEMO_POLICY } from "./payments.dto";
+
+// With no model configured, every flagged payment escalates to the owner's Nod (Second Look fails safe).
+const NO_MODEL: SecondLookDeps = {
+  decide: async () => { throw new Error("No Second Look model configured"); },
+  timeoutMs: 1800,
+};
 
 export class PaymentsService {
-  private policy: SpendPolicy = DEFAULT_DEMO_POLICY;
-
-  constructor(private repo: PaymentsRepository = paymentsRepository) {
+  constructor(private repo: PaymentsRepository = paymentsRepository, private secondLookDeps: SecondLookDeps = NO_MODEL) {
     // Connect approval decisions to payment transitions
     approvalsService.setDecisionHandler(async (paymentId, decision) => {
       if (decision === "approve") {
@@ -30,12 +36,8 @@ export class PaymentsService {
     });
   }
 
-  setSpendPolicy(policy: SpendPolicy): void {
-    this.policy = policy;
-  }
-
-  getSpendPolicy(): SpendPolicy {
-    return this.policy;
+  useSecondLook(deps: SecondLookDeps): void {
+    this.secondLookDeps = deps;
   }
 
   async listPayments(): Promise<Payment[]> {
@@ -51,6 +53,17 @@ export class PaymentsService {
     return { payment, receipt };
   }
 
+  private async block(
+    base: Omit<Payment, "verdict" | "decided_by" | "status" | "kora_reference">,
+    receipt: Receipt,
+    decidedBy: Payment["decided_by"],
+  ): Promise<{ payment: Payment; receipt: Receipt }> {
+    const payment: Payment = { ...base, verdict: "block", decided_by: decidedBy, status: "blocked", kora_reference: null };
+    await this.repo.savePayment(payment, receipt);
+    eventsService.emitPaymentUpdated(payment);
+    return { payment, receipt };
+  }
+
   /**
    * Main check ladder per PRD 5.2.
    */
@@ -61,6 +74,17 @@ export class PaymentsService {
     const paymentId = `pay_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const reference = `AL-${paymentId}`;
     const now = new Date().toISOString();
+    const payeeName = getPayee(req.payee_id)?.name ?? req.payee_id;
+    const base = {
+      id: paymentId,
+      agent_id: agent.id,
+      payee_id: req.payee_id,
+      payee_name: payeeName,
+      amount_kobo: req.amount_kobo,
+      category: req.category,
+      reason: req.reason,
+      created_at: now,
+    };
 
     const checks: Check[] = [];
 
@@ -71,65 +95,36 @@ export class PaymentsService {
       detail: `Badge verified for agent ${agent.name} (${agent.id})`,
     });
 
+    // Step 2: Deterministic Rules (Spec Gate): the owner's latest saved mandate.
+    const mandate = await mandates.current();
     const receipt: Receipt = {
       payment_id: paymentId,
-      policy_version: 1,
+      policy_version: mandate?.version ?? 1, // the contract needs a positive version even when no rule exists
       checks,
     };
 
-    // Step 2: Deterministic Rules (Spec Gate)
-    const isCategoryAllowed = this.policy.allowed_categories.includes(req.category.toLowerCase());
-    const isPayeeAllowed = this.policy.allowed_payees.includes(req.payee_id);
-
-    const weeklySpent = await this.repo.getWeeklySpend(agent.id);
-    const weeklyLimit = this.policy.spending_limits.find((l) => l.interval === "weekly")?.amount_kobo ?? 5_000_000;
-    const perPaymentLimit = this.policy.spending_limits.find((l) => l.interval === "per_payment")?.amount_kobo ?? 2_000_000;
-
-    let rulesPassed = true;
-    let ruleFailDetail = "";
-
-    if (!isCategoryAllowed) {
-      rulesPassed = false;
-      ruleFailDetail = `Category "${req.category}" is not in allowed categories: ${this.policy.allowed_categories.join(", ")}`;
-    } else if (req.amount_kobo > perPaymentLimit) {
-      rulesPassed = false;
-      ruleFailDetail = `Amount ${formatNaira(req.amount_kobo)} exceeds single payment limit of ${formatNaira(perPaymentLimit)}`;
-    } else if (weeklySpent + req.amount_kobo > weeklyLimit) {
-      rulesPassed = false;
-      ruleFailDetail = `Weekly cap ${formatNaira(weeklyLimit)} exceeded: ${formatNaira(weeklySpent)} already spent`;
+    if (!mandate) {
+      checks.push({ step: "rules", result: "fail", detail: "No spending rule saved yet: the owner sets one in Spec Gate" });
+      return this.block(base, receipt, "rules");
     }
 
-    if (!rulesPassed) {
-      checks.push({
-        step: "rules",
-        result: "fail",
-        detail: ruleFailDetail,
-      });
+    const decision = evaluatePolicy(mandate.policy, req, {
+      now: new Date(now),
+      spent_today_kobo: await this.repo.getDailySpend(agent.id),
+      spent_this_week_kobo: await this.repo.getWeeklySpend(agent.id),
+      payee_spent_24h_kobo: await this.repo.getRollingPayeeSpend24h(req.payee_id),
+    });
+    const reasons = decision.reasons.map((r) => r.message).join("; ");
 
-      const blockedPayment: Payment = {
-        id: paymentId,
-        agent_id: agent.id,
-        payee_id: req.payee_id,
-        payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
-        amount_kobo: req.amount_kobo,
-        category: req.category,
-        reason: req.reason,
-        verdict: "block",
-        decided_by: "rules",
-        status: "blocked",
-        kora_reference: null,
-        created_at: now,
-      };
-
-      await this.repo.savePayment(blockedPayment, receipt);
-      eventsService.emitPaymentUpdated(blockedPayment);
-      return { payment: blockedPayment, receipt };
+    if (decision.verdict === "block") {
+      checks.push({ step: "rules", result: "fail", detail: `Rule v${mandate.version}: ${reasons}` });
+      return this.block(base, receipt, "rules");
     }
 
     checks.push({
       step: "rules",
       result: "pass",
-      detail: `weekly cap ${formatNaira(weeklyLimit)}: ${formatNaira(weeklySpent + req.amount_kobo)} of ${formatNaira(weeklyLimit)} used`,
+      detail: `Rule v${mandate.version}: ${decision.verdict === "nod" ? `needs Nod (${reasons})` : "within limits"}`,
     });
 
     // Step 3: Reserve Funds with Balance Condition
@@ -146,114 +141,63 @@ export class PaymentsService {
         result: "fail",
         detail: (err as Error).message,
       });
-
-      const blockedPayment: Payment = {
-        id: paymentId,
-        agent_id: agent.id,
-        payee_id: req.payee_id,
-        payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
-        amount_kobo: req.amount_kobo,
-        category: req.category,
-        reason: req.reason,
-        verdict: "block",
-        decided_by: "rules",
-        status: "blocked",
-        kora_reference: null,
-        created_at: now,
-      };
-
-      await this.repo.savePayment(blockedPayment, receipt);
-      eventsService.emitPaymentUpdated(blockedPayment);
-      return { payment: blockedPayment, receipt };
+      return this.block(base, receipt, "rules");
     }
 
-    // Step 4: Second Look (Intent & Flag Check)
-    let needsNod = false;
-    let nodReason: "above_threshold" | "second_look_flag" | "new_payee" = "above_threshold";
+    // Step 4: Second Look, only on flagged payments. It can block or escalate, never approve.
+    const { flagged, flags } = shouldSecondLook(req, {
+      payee_payments_today: await this.repo.countPayeePayments24h(req.payee_id),
+    });
+    let look: SecondLookOutcome | undefined;
 
-    const isPoisonedOrFlagged = req.reason.toLowerCase().includes("compromised") ||
-      req.reason.toLowerCase().includes("poisoned") ||
-      req.reason.toLowerCase().includes("malicious");
+    if (!flagged) {
+      checks.push({ step: "second_look", result: "skipped", detail: "not flagged" });
+    } else {
+      look = await secondLook(
+        {
+          owner_rule: mandate.english_rule,
+          payment: { ...req, payee_name: payeeName },
+          page_text: req.page_text,
+          flags,
+        },
+        this.secondLookDeps,
+      );
 
-    if (isPoisonedOrFlagged) {
-      // Second Look blocks suspicious requests
-      await ledgerService.releaseHold(paymentId);
+      if (look.verdict === "block") {
+        await ledgerService.releaseHold(paymentId);
+        checks.push({ step: "second_look", result: "fail", detail: `Blocked: ${look.reason}` });
+        return this.block(base, receipt, "second_look");
+      }
+
       checks.push({
         step: "second_look",
-        result: "fail",
-        detail: "Second Look: blocked, suspicious or poisoned instruction detected in stated reason",
+        result: look.verdict === "ok" ? "pass" : "fail",
+        detail: `${look.verdict === "ok" ? "OK" : "Escalated to owner"} (${flags.join(", ")}): ${look.reason}`,
       });
-
-      const blockedPayment: Payment = {
-        id: paymentId,
-        agent_id: agent.id,
-        payee_id: req.payee_id,
-        payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
-        amount_kobo: req.amount_kobo,
-        category: req.category,
-        reason: req.reason,
-        verdict: "block",
-        decided_by: "second_look",
-        status: "blocked",
-        kora_reference: null,
-        created_at: now,
-      };
-
-      await this.repo.savePayment(blockedPayment, receipt);
-      eventsService.emitPaymentUpdated(blockedPayment);
-      return { payment: blockedPayment, receipt };
     }
 
-    // If clean: second look is skipped
-    checks.push({
-      step: "second_look",
-      result: "skipped",
-      detail: "not flagged",
-    });
+    // Step 5: Nod. The rules decide unknown payees and thresholds; Second Look can only add an escalation.
+    const nodReason: "above_threshold" | "second_look_flag" | "new_payee" | undefined =
+      decision.reasons.some((r) => r.code === "NEW_PAYEE") ? "new_payee"
+      : decision.verdict === "nod" ? "above_threshold"
+      : look?.verdict === "escalate" ? "second_look_flag"
+      : undefined;
 
-    // Step 5: Nod (Threshold & Payee Approval Check)
-    const rollingPayeeSpent = await this.repo.getRollingPayeeSpend24h(req.payee_id);
-
-    if (!isPayeeAllowed) {
-      needsNod = true;
-      nodReason = "new_payee";
-    } else if (req.amount_kobo > this.policy.nod_above_kobo) {
-      needsNod = true;
-      nodReason = "above_threshold";
-    } else if (rollingPayeeSpent + req.amount_kobo > this.policy.nod_rolling_payee_24h_kobo) {
-      needsNod = true;
-      nodReason = "above_threshold";
-    }
-
-    if (needsNod) {
+    if (nodReason) {
       checks.push({
         step: "nod",
         result: "pass",
-        detail: `Waiting for owner Nod (${nodReason === "above_threshold" ? `above ${formatNaira(this.policy.nod_above_kobo)}` : "new payee"})`,
+        detail: `Waiting for owner Nod (${nodReason === "second_look_flag" ? look!.reason : reasons})`,
       });
 
-      const nodPayment: Payment = {
-        id: paymentId,
-        agent_id: agent.id,
-        payee_id: req.payee_id,
-        payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
-        amount_kobo: req.amount_kobo,
-        category: req.category,
-        reason: req.reason,
-        verdict: "nod",
-        decided_by: "nod",
-        status: "pending_approval",
-        kora_reference: null,
-        created_at: now,
-      };
-
+      const nodPayment: Payment = { ...base, verdict: "nod", decided_by: "nod", status: "pending_approval", kora_reference: null };
       await this.repo.savePayment(nodPayment, receipt);
 
       // Create owner approval request for /nod page
       await approvalsService.createApproval({
         payment_id: paymentId,
         amount_kobo: req.amount_kobo,
-        payee_name: nodPayment.payee_name,
+        payee_name: payeeName,
         reason: req.reason,
         why: nodReason,
       });
@@ -265,7 +209,7 @@ export class PaymentsService {
     checks.push({
       step: "nod",
       result: "skipped",
-      detail: `under ${formatNaira(this.policy.nod_above_kobo)} threshold`,
+      detail: `under ${formatNaira(mandate.policy.nod_above_kobo)} threshold`,
     });
 
     // Step 6: Payout through Rails
@@ -275,7 +219,7 @@ export class PaymentsService {
       reference,
       amount_kobo: req.amount_kobo,
       payee_id: req.payee_id,
-      payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
+      payee_name: payeeName,
       narration: req.reason,
       ...payoutAccount(req.payee_id),
     });
@@ -303,18 +247,11 @@ export class PaymentsService {
     }
 
     const settledPayment: Payment = {
-      id: paymentId,
-      agent_id: agent.id,
-      payee_id: req.payee_id,
-      payee_name: req.payee_id.replace(/^payee_/, "").replace(/_/g, " "),
-      amount_kobo: req.amount_kobo,
-      category: req.category,
-      reason: req.reason,
+      ...base,
       verdict: "allow",
-      decided_by: "rules",
+      decided_by: look?.verdict === "ok" ? "second_look" : "rules",
       status: payoutResult.status,
       kora_reference: reference,
-      created_at: now,
     };
 
     await this.repo.savePayment(settledPayment, receipt);

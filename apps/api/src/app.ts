@@ -6,18 +6,32 @@ import { notFound } from "./middlewares/notFound";
 import { ownerAuth } from "./middlewares/ownerAuth";
 import { agentsRepository, type AgentRepository } from "./modules/agents/agents.repository";
 import { jwksRouter } from "./modules/agents/agents.routes";
+import { paymentsService } from "./modules/payments/payments.service";
+import type { GeneratePolicy } from "./modules/mandates/mandates.service";
+import type { SecondLookDeps } from "./modules/second-look/second-look.service";
 import { buildV1 } from "./routes/v1";
+import { AppError } from "./shared/AppError";
 
 export interface AppDeps {
   agents?: AgentRepository;
   ownerPin?: string;
   sessionSecret?: string;
+  /** Spec Gate model (server.ts builds it from env). Without one, compile answers 503. */
+  generatePolicy?: GeneratePolicy;
+  /** Second Look model. Without one, flagged payments escalate to the owner's Nod. */
+  secondLook?: SecondLookDeps;
 }
+
+const noPolicyModel: GeneratePolicy = async () => {
+  throw new AppError(503, "AI_NOT_CONFIGURED", "No AI model is configured for Spec Gate");
+};
 
 export function createApp(deps: AppDeps = {}) {
   // One shared agent store for registration, signature checks and payments.
   const agents = deps.agents ?? agentsRepository;
   const secret = deps.sessionSecret ? new TextEncoder().encode(deps.sessionSecret) : randomBytes(32);
+
+  if (deps.secondLook) paymentsService.useSecondLook(deps.secondLook);
 
   const app = express();
   // One proxy in front (ngrok or the host), so req.ip is the real client and lockouts stay per person.
@@ -31,6 +45,7 @@ export function createApp(deps: AppDeps = {}) {
     secret,
     ownerAuth: ownerAuth(secret),
     agentAuth: agentSignature({ agents }),
+    generatePolicy: deps.generatePolicy ?? noPolicyModel,
   }));
   app.use(notFound);
   app.use(errorHandler);

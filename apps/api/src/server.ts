@@ -1,11 +1,18 @@
 import { createApp } from "./app";
 import { env } from "./config/env";
 import { connectMongo } from "./db/mongo";
+import { createPolicyGenerator } from "./modules/mandates/mandates.ai";
+import { createDecider } from "./modules/second-look/second-look.ai";
 
 async function bootstrap() {
   await connectMongo();
 
-  createApp({ ownerPin: env.OWNER_PIN, sessionSecret: env.SESSION_SECRET }).listen(env.PORT, () => {
+  createApp({
+    ownerPin: env.OWNER_PIN,
+    sessionSecret: env.SESSION_SECRET,
+    generatePolicy: createPolicyGenerator(env),
+    secondLook: { decide: createDecider(env), timeoutMs: env.LLM_TIMEOUT_MS },
+  }).listen(env.PORT, () => {
     console.log(`Ailo API on :${env.PORT} (Kora ${env.KORA_MODE}, LLM ${env.LLM_PROVIDER})`);
   });
 }

@@ -10,7 +10,11 @@ let base: string;
 
 beforeAll(() => {
   resetMemoryDb();
-  server = createApp({ ownerPin: "246810", sessionSecret: "s".repeat(32) }).listen(0);
+  server = createApp({
+    ownerPin: "246810",
+    sessionSecret: "s".repeat(32),
+    secondLook: { decide: async () => ({ verdict: "ok", reason: "fits the rule" }), timeoutMs: 1000 },
+  }).listen(0);
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
 afterAll(() => server.close());
@@ -55,6 +59,8 @@ describe("Ailo API end to end", () => {
     expect((await call("POST", "/v1/approvals/apr_x", { body: { decision: "approve" } })).status).toBe(401);
     expect((await call("POST", "/v1/ops/reconcile")).status).toBe(401);
     expect((await call("GET", "/v1/events")).status).toBe(401);
+    expect((await call("POST", "/v1/mandates", { body: {} })).status).toBe(401);
+    expect((await call("POST", "/v1/mandates/compile", { body: { english: "x" } })).status).toBe(401);
   });
 
   it("payments refuse unsigned requests", async () => {
@@ -83,6 +89,23 @@ describe("Ailo API end to end", () => {
     const created = await call("POST", "/v1/agents", { owner, body: { name: "Demo Shop Agent", public_jwk: keys.publicJwk } });
     expect(created.status).toBe(201);
     const agent = (await created.json()) as { id: string };
+
+    const policy = {
+      allowed_categories: ["groceries"],
+      allowed_payees: ["payee_mama_ngozi"],
+      spending_limits: [{ amount_kobo: 2_000_000, interval: "per_payment" }],
+      nod_above_kobo: 1_000_000,
+      nod_rolling_payee_24h_kobo: 1_000_000,
+      expires_at: "2030-01-01T00:00:00.000Z",
+    };
+    const saved = await call("POST", "/v1/mandates", { owner, body: { english: "Groceries from Mama Ngozi, up to N20,000", policy } });
+    expect(saved.status).toBe(201);
+
+    // The agent reads the same rule it will be held to.
+    const sig = await signRequest(keys.privateKey, agent.id, { method: "GET", path: "/v1/mandates/current" });
+    const current = await fetch(`${base}/v1/mandates/current`, { headers: { authorization: `Agent ${sig}` } });
+    expect(current.status).toBe(200);
+    expect(((await current.json()) as { version: number }).version).toBe(1);
 
     const paid = await signedPayment(keys, agent.id, {
       payee_id: "payee_mama_ngozi", amount_kobo: 850000, category: "groceries", reason: "Restock rice for demo store",

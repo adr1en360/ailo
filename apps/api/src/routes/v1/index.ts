@@ -5,6 +5,8 @@ import approvals from "../../modules/approvals/approvals.routes";
 import events from "../../modules/events/events.routes";
 import health from "../../modules/health/health.routes";
 import ledger from "../../modules/ledger/ledger.routes";
+import { mandatesRouter } from "../../modules/mandates/mandates.routes";
+import type { GeneratePolicy } from "../../modules/mandates/mandates.service";
 import { ownerRouter } from "../../modules/owner/owner.routes";
 import { paymentsRouter } from "../../modules/payments/payments.routes";
 import reconcile from "../../modules/reconcile/reconcile.routes";
@@ -16,6 +18,7 @@ export interface V1Deps {
   secret: Uint8Array;
   ownerAuth: RequestHandler;
   agentAuth: RequestHandler;
+  generatePolicy: GeneratePolicy;
 }
 
 // One gate per caller: agents sign (agentAuth), the owner holds a session (ownerAuth),
@@ -26,6 +29,7 @@ export function buildV1(deps: V1Deps) {
   v1.use(ownerRouter(deps));
   v1.use(agentsRouter(deps));
   v1.use(paymentsRouter(deps));
+  v1.use(mandatesRouter(deps));
   v1.use(webhooks);
   // Owner-only modules: guarded here so the modules stay unaware of auth.
   v1.use(["/ledger", "/approvals", "/ops", "/events"], deps.ownerAuth);
